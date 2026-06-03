@@ -269,7 +269,10 @@ class Watershed:
             image = await snowpack.fetch_geojson(
                 self.geojson, layer=self.snowpack_layer, timestamp=timestamp, zoom=SENTINEL_ZOOM
             )
-            image = snowpack.add_date_bar(image, date)
+            label = date
+            if self.snowpack_layer == "ag":
+                label = f"{date}  ·  snow {snowpack.snow_fraction(image) * 100:.0f}%"
+            image = snowpack.add_date_bar(image, label)
             image.save(filename)
             await self._log(f'Sentinel image generated: "{filename}"')
             return {
@@ -537,4 +540,4 @@ clients: dict[str, web.WebSocketResponse] = {}
 
 if __name__ == "__main__":
     print("Starting web...")
-    web.run_app(app, host="::", port=8080, access_log=access_log)
+    web.run_app(app, host=["0.0.0.0", "::"], port=8080, access_log=access_log)

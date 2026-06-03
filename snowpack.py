@@ -10,6 +10,7 @@ import sys
 import time
 
 import aiohttp
+import numpy as np
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -157,6 +158,20 @@ def mask_to_polygon(
     rgba = image.convert("RGBA")
     rgba.putalpha(mask)
     return rgba
+
+
+def snow_fraction(image: Image.Image) -> float:
+    """Fraction of polygon-masked pixels that look like snow in the 'ag' composite.
+    Snow renders as bright teal/cyan because CalTopo mixes NDSI into the band stack.
+    Restricted to alpha>0 when present so out-of-watershed pixels don't dilute the count."""
+    hsv = np.array(image.convert("HSV"))
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    snow = (h >= 110) & (h <= 145) & (s >= 40) & (v >= 100)
+    if image.mode == "RGBA":
+        valid = np.array(image)[..., 3] > 0
+        total = int(valid.sum())
+        return float((snow & valid).sum()) / total if total else 0.0
+    return float(snow.mean())
 
 
 def add_date_bar(image: Image.Image, date: str) -> Image.Image:
