@@ -32,3 +32,30 @@ systemctl --user enable --now watershed
 View logs with `journalctl --user -u watershed -f`.
 
 The unit assumes the repo is checked out at `~/watershed` with a venv at `~/watershed/venv`.
+
+## Catchment library and CLI
+
+`catchment.py` holds the delineation logic on its own, so other tools (such as the flow estimator) can reuse it without the web server:
+
+```python
+import asyncio, catchment
+result = asyncio.run(catchment.delineate(38.2851, -109.8732))
+result.area_km2, result.elev_mean_m, result.polygon
+```
+
+Or from the shell:
+
+```bash
+python catchment.py 38.2851 -109.8732 --output canyon.geojson
+```
+
+Results are cached under `output/cache/`, keyed by point, DEM, snap and box size, so looking up the same canyon twice skips the download and computation.
+
+## Tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest tests
+```
+
+Tests use a synthetic DEM and never call USGS, so they run offline.

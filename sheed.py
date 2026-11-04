@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from pysheds.grid import Grid
-import numpy as np
 import simplekml
 import aiohttp
 import asyncio
@@ -9,13 +7,14 @@ import geojson
 import os
 import uuid
 from aiohttp import web
-from typing import List, Union, cast
+
 import urllib.parse
 import json
 import datetime
-from shapely.geometry import shape as shapely_shape, Polygon
+from shapely.geometry import mapping
 from dotenv import load_dotenv
 
+import catchment
 import snowpack
 
 load_dotenv()
@@ -43,7 +42,6 @@ def make_id() -> str:
     return str(uuid.uuid4())[:4]
 
 
-DATASET_ARCSEC = {"USGS30m": 1.0, "USGS10m": 1.0 / 3.0}
 
 
 class Watershed:
@@ -99,145 +97,30 @@ class Watershed:
         await broadcast_message(f"log:{log_message}", self.id)
 
     async def work(self):
-        self.dem_filename = await self.get_dem()
-        self.catchment_shapes = await self.calculate_catchment()
-        self.clipped = await self.clipping_check()
-
-        if self.clipped:
-            await self._log("Clipping detected, retrying with expand_factor=0.1")
-            self.expand_factor = 0.1
+        self.catchment = await catchment.delineate(
+            self.lat,
+            self.lon,
+            dataset=self.dem,
+            snap=self.snap,
+            expand_factor=self.expand_factor,
+            workdir=self.outdir,
+            log=self._log,
+        )
+        if self.catchment.expand_factor != self.expand_factor:
+            self.expand_factor = self.catchment.expand_factor
             self.generate_box()
             self._generate_default_name()
-
-            self.dem_filename = await self.get_dem()
-            self.catchment_shapes = await self.calculate_catchment()
-            self.clipped = await self.clipping_check()
+        self.clipped = self.catchment.clipped
+        if self.catchment.snapped:
+            self.snapped_x, self.snapped_y = self.catchment.snapped
+        self.catchment_shapes = [
+            geojson.loads(json.dumps(mapping(p))) for p in self.catchment.polygons
+        ]
 
         self.geojson = await self.export_geojson()
         self.kml = await self.export_kml()
         self.sentinels = await self.export_sentinels() if self.snowpack else []
         await self._log("Done!")
-
-    async def get_dem(self) -> str:
-        dataset = self.dem
-
-        dem_filename = f"{self.outdir}/dem_{dataset}_{self.name}.tif"
-
-        # Use cached DEM if possible
-        if os.path.isfile(dem_filename):
-            await self._log(f"Using cached DEM {dem_filename}")
-            return dem_filename
-
-        # Match the source's native arc-second grid so output cells are square
-        # in degrees — pysheds' D8 flow direction assumes square pixels, and a
-        # cos(lat) correction here gave non-square cells that snapped to the
-        # wrong drainage.
-        deg_per_cell = DATASET_ARCSEC[dataset] / 3600.0
-        width_px = max(1, round((self.max_x - self.min_x) / deg_per_cell))
-        height_px = max(1, round((self.max_y - self.min_y) / deg_per_cell))
-
-        params = {
-            "bbox": f"{self.min_x},{self.min_y},{self.max_x},{self.max_y}",
-            "bboxSR": "4326",
-            "imageSR": "4326",
-            "size": f"{width_px},{height_px}",
-            "format": "tiff",
-            "pixelType": "F32",
-            "noData": "-9999",
-            "interpolation": "RSP_NearestNeighbor",
-            "f": "image",
-        }
-
-        base_url = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
-
-        await self._log(
-            f"Fetching {dataset} DEM ({width_px}x{height_px} px) centered on {self.lat},{self.lon} from USGS 3DEP..."
-        )
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base_url, params=params) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    with open(dem_filename, "wb") as file:
-                        file.write(content)
-                    await self._log(f"{dem_filename} downloaded successfully.")
-                else:
-                    await self._log(f"Error: {response.status}. Request was {params}")
-                    await self._log(await response.text())
-                    raise
-        return dem_filename
-
-    async def calculate_catchment(self) -> List:
-        if not self.dem_filename:
-            raise
-
-        await self._log("Preparing DEM")
-        grid = Grid.from_raster(self.dem_filename)
-        dem = grid.read_raster(self.dem_filename)
-
-        pit_filled_dem = grid.fill_pits(dem)
-        flooded_dem = grid.fill_depressions(pit_filled_dem)
-        inflated_dem = grid.resolve_flats(flooded_dem)
-
-        dirmap = (64, 128, 1, 2, 4, 8, 16, 32)
-
-        await self._log("Calculating catchment")
-        fdir = grid.flowdir(inflated_dem, dirmap=dirmap)
-        acc = grid.accumulation(fdir, dirmap=dirmap)
-
-        if self.snap:
-            # Snap pour point to high accumulation cell
-            self.snapped_x, self.snapped_y = grid.snap_to_mask(
-                acc > 1000, (self.lon, self.lat)
-            )
-            catch = grid.catchment(
-                x=self.snapped_x,
-                y=self.snapped_y,
-                fdir=fdir,
-                dirmap=dirmap,
-                xytype="coordinate",
-            )
-        else:
-            catch = grid.catchment(
-                x=self.lon, y=self.lat, fdir=fdir, dirmap=dirmap, xytype="coordinate"
-            )
-
-        grid.clip_to(catch)
-        catch_view = grid.view(catch, dtype=np.uint8)
-
-        shapes = [shape for shape in grid.polygonize(catch_view)]
-        # assert len(shapes) == 1  # Can't have multiple watersheds
-
-        return shapes
-
-    async def clipping_check(self) -> bool:
-        """
-        Detect if the catchment polygon comes close to the edge of the DEM. If so,
-        it's likely the catchment has been clipped and the DEM should be enlarged.
-        """
-
-        # Threshold scales with cell size: a polygonized vertex sitting on the
-        # bbox edge can land up to one cell inward, so 2 cells is a robust
-        # margin at any resolution.
-        threshold = 2 * DATASET_ARCSEC[self.dem] / 3600.0
-
-        shape = self.catchment_shapes[0][0]
-
-        catchment_polygon = cast(Polygon, shapely_shape(shape))
-
-        for x, y in catchment_polygon.exterior.coords:
-            d = min(
-                [
-                    abs(self.max_x - x),
-                    abs(self.min_x - x),
-                    abs(self.max_y - y),
-                    abs(self.min_y - y),
-                ]
-            )
-            if d < threshold:
-                await self._log(f"Clipping detected: {y},{x} {d}")
-                return True
-        return False
 
     async def export_geojson(self) -> str:
         if not self.catchment_shapes:
@@ -246,9 +129,9 @@ class Watershed:
         features = []
 
         for shape in self.catchment_shapes:
-            geo_polygon = geojson.Polygon([(shape[0]["coordinates"][0])])
+            geo_polygon = geojson.Polygon([shape["coordinates"][0]])
             geo_polygon_feature = geojson.Feature(
-                geometry=geo_polygon, properties={"name": "Example Polygon"}
+                geometry=geo_polygon, properties={"name": self.name, **self.catchment.stats()}
             )
             features.append(geo_polygon_feature)
 
@@ -354,7 +237,7 @@ class Watershed:
 
         for shape in self.catchment_shapes:
             poly = kml.newpolygon(name=f"Watershed - {self.name}")
-            poly.outerboundaryis = shape[0]["coordinates"][0]
+            poly.outerboundaryis = shape["coordinates"][0]
             poly.style.linestyle.color = simplekml.Color.blue
             poly.style.linestyle.width = 1
             poly.style.polystyle.color = simplekml.Color.changealphaint(
@@ -388,7 +271,9 @@ async def handle_submit(request):
         expand_factor = float(data["expand_factor"])
         client_id = data["client_id"]
         dem = data["dem"]
-        snap = data["snap"]
+        snap = bool(int(data["snap"]))
+        if dem not in catchment.DATASET_ARCSEC:
+            raise ValueError(dem)
         snowpack_on = bool(int(data.get("snowpack", 0)))
         snowpack_layer = data.get("snowpack_layer", "tc")
         snowpack_compare_days = max(0, int(data.get("snowpack_compare_days", 0) or 0))
@@ -413,6 +298,7 @@ async def handle_submit(request):
     response_content["lat"] = watershed.lat
     response_content["lon"] = watershed.lon
     response_content["name"] = watershed.name
+    response_content["catchment"] = watershed.catchment.stats()
 
     return web.Response(text=json.dumps(response_content), content_type="text/json")
 
