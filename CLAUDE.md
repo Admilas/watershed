@@ -35,8 +35,10 @@ App is configured for the 'sea' region with 1GB memory.
 
 ### Core Components
 
-- **sheed.py**: Main application file containing the complete web server and watershed calculation logic
-- **Watershed class**: Handles DEM fetching, watershed calculation, and output generation
+- **catchment.py**: Library for DEM fetching, catchment delineation, area/elevation stats, clipping detection and a per-point result cache. Also a CLI.
+- **sheed.py**: Web server; its Watershed class calls `catchment.delineate()` then writes KML/GeoJSON and Sentinel imagery
+- **snowpack.py**: Sentinel-2 imagery from CalTopo tiles and snow-fraction estimate
+- **tests/**: pytest suite using a synthetic DEM (no network)
 - **Web interface**: aiohttp-based server with WebSocket support for real-time logging
 - **Frontend**: Static HTML/CSS/JS in `/static/` directory
 
